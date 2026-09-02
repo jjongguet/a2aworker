@@ -1,0 +1,5 @@
+# compiled binary
+/a2aworker
+
+# GJC session runtime state
+.gjc/

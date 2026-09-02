@@ -1,0 +1,27 @@
+# deploy/hermes-a2a-bridge.service — 배포용 systemd 유닛 "템플릿".
+# 지금은 적용하지 않는다(연동 준비물). 실전 배포 시 절차:
+#   1) a2aworker 를 레포 승격 후 VM(hermes-tokyo)에서 빌드: GOOS=linux GOARCH=amd64 go build -o /usr/local/bin/a2a-bridge .
+#   2) 이 유닛을 /etc/systemd/system/hermes-a2a-bridge.service 로 복사
+#   3) EnvironmentFile=/etc/hermes-a2a-bridge.env (아래 주석 참조 — 실 파일은 VM에서만 관리, Git 금지)
+#   4) systemctl daemon-reload && systemctl enable --now hermes-a2a-bridge
+# 관성: 기존 hermes gateway 서비스들과 동일한 패턴(user-level gateway install과 달리 bridge는 시스템 유닛).
+[Unit]
+Description=Hermes A2A bridge (agent-to-agent delegation gateway)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/a2a-bridge
+# 실전 활성화 스위치(연동 준비 단계에서는 비활성):
+# EnvironmentFile=/etc/hermes-a2a-bridge.env
+#   A2A_EXECUTOR=hermes
+#   HERMES_HOME_DIR=/root/.hermes
+#   HERMES_BUDGET_USD=0.50
+#   HERMES_TIMEOUT_SECS=180
+# 리스너 바인딩은 main.go 의 :9600 고정값 → 실전 배포 시 리버스 프록시(TLS) 뒤에 둘 것.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
