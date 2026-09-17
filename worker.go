@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -135,6 +136,9 @@ func runWork(hubOverride string, acpBin string, interval time.Duration) error {
 	for {
 		job, err := pollOnce(client, hub, cfg)
 		if err != nil {
+			if errors.Is(err, errAuthRejected) {
+				return fmt.Errorf("worker token rejected by hub (hub restarted or worker re-joined) — re-join required: %w", err)
+			}
 			fmt.Println("poll error:", err)
 			time.Sleep(interval)
 			continue
@@ -148,8 +152,10 @@ func runWork(hubOverride string, acpBin string, interval time.Duration) error {
 		if execErr != nil {
 			state, text = StateFailed, execErr.Error()
 		}
-		if err := reportResult(client, hub, cfg, job.ID, state, text); err != nil {
-			fmt.Println("report error:", err)
+		if err := reportResultRetry(client, hub, cfg, job.ID, state, text); err != nil {
+			// 결과가 hub에 못 닿으면 hub는 이 잡을 재배일한다(maxRetry까지) —
+			// 부수효과 있는 프롬프트의 중복 실행 위험을 알린다.
+			fmt.Printf("job %s report FAILED after retries: %v — hub will redeliver; duplicate execution possible\n", job.ID, err)
 		} else {
 			fmt.Printf("job %s reported: %s\n", job.ID, state)
 		}
@@ -165,6 +171,9 @@ func pollOnce(client *http.Client, hub string, cfg *WorkerConfig) (*HubJobWire, 
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: poll http %d: %.120s", errAuthRejected, resp.StatusCode, string(raw))
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("poll http %d: %.120s", resp.StatusCode, string(raw))
 	}
@@ -185,6 +194,9 @@ func reportResult(client *http.Client, hub string, cfg *WorkerConfig, jobID, sta
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%w: result http %d", errAuthRejected, resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("result http %d: %.120s", resp.StatusCode, string(raw))
@@ -193,6 +205,32 @@ func reportResult(client *http.Client, hub string, cfg *WorkerConfig, jobID, sta
 }
 
 // ---- ACP stdio 클라이언트 (gjc acp / claude 등 공통) ----
+
+// errAuthRejected — 허브가 워커 토큰을 401/403로 거절. 허브 재시작(서명 키
+// 재생성) 또는 같은 workerID의 re-join(토큰 폐기)뒤에는 재접속으로만 회복되므로
+// 일시 오류로 재시도하지 말고 치명 에러로 전파한다.
+var errAuthRejected = errors.New("worker auth rejected")
+
+// reportRetryBackoff — reportResultRetry의 재시도 간격(테스트에서 단축).
+var reportRetryBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+// reportResultRetry — 결과 보고를 백오프 재시도. 1회 실패로 결과를 버리면
+// hub는 잡을 미보고로 간주해 재배일하고, 부수효과 있는 프롬프트가 이중 실행된다.
+func reportResultRetry(client *http.Client, hub string, cfg *WorkerConfig, jobID, state, text string) error {
+	var err error
+	for attempt := 0; attempt <= len(reportRetryBackoff); attempt++ {
+		if attempt > 0 {
+			time.Sleep(reportRetryBackoff[attempt-1])
+		}
+		if err = reportResult(client, hub, cfg, jobID, state, text); err == nil {
+			return nil
+		}
+		if errors.Is(err, errAuthRejected) {
+			return err // 재시도로 회복되지 않는다
+		}
+	}
+	return fmt.Errorf("after %d attempts: %w", len(reportRetryBackoff)+1, err)
+}
 
 // runACPAgent — ACP stdio 자식 프로세스를 띄우고 initialize→session/new→prompt로
 // 프롬프트를 넣어 최종 텍스트를 모아 반환한다. ACP 메시지는 JSON-RPC 2.0 한 줄씩.

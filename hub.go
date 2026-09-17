@@ -11,6 +11,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -140,7 +141,9 @@ func (h *Hub) mintWorkerToken(workerID string, skills []string) string {
 	return mint(h.key, Claims{Sub: "worker:" + workerID, Skills: skills, Iat: now(), TraceID: newTraceID()})
 }
 
-// verifyWorker — Bearer에서 claims 복원 + 등록부 일치 확인.
+// verifyWorker — Bearer에서 claims 복원 + 등록부 일치 확인. 등록부의 TokenHash와
+// 상수시간 비교까지 통과해야 유효하다: 서명만 보고 지나가면 같은 workerID의 옛
+// 토큰이 re-join 이후에도 영구 유효해 폐기(revocation)가 없어진다.
 func (h *Hub) verifyWorker(bearerToken string) (*WorkerReg, bool) {
 	claims, err := verify(h.key, bearerToken)
 	if err != nil || !strings.HasPrefix(claims.Sub, "worker:") {
@@ -149,7 +152,101 @@ func (h *Hub) verifyWorker(bearerToken string) (*WorkerReg, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	w, ok := h.workers[strings.TrimPrefix(claims.Sub, "worker:")]
-	return w, ok
+	if !ok || subtle.ConstantTimeCompare([]byte(h.hashToken(bearerToken)), []byte(w.TokenHash)) != 1 {
+		return nil, false
+	}
+	return w, true
+}
+
+// ---- 운영자(admin) 라우팅 ----
+
+// Handler — 허브 HTTP 전체 라우팅. worker 면(join/poll/result POST)은 각자의
+// 인증(초대코드·worker 토큰)을 쓰고, 운영자 면(invite/dispatch/result/<id>/
+// workers)은 adminToken Bearer(상수시간 비교)로 보호한다. adminToken이 비면
+// 운영자 면은 전부 403으로 폐쇄(fail-closed) — 무인증 dispatch는 원격 워커에서
+// 임의 프롬프트 실행(RCE)이므로 기본 개방하지 않는다.
+func (h *Hub) Handler(adminToken string) http.Handler {
+	mux := http.NewServeMux()
+	requireAdmin := func(w http.ResponseWriter, r *http.Request) bool {
+		if adminToken == "" {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "hub admin API disabled — set A2A_ADMIN_TOKEN on the hub"})
+			return false
+		}
+		presented := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(presented), []byte(adminToken)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "admin auth failed"})
+			return false
+		}
+		return true
+	}
+	mux.HandleFunc("/hub/join", h.serveJoin)
+	mux.HandleFunc("/hub/poll", h.servePoll)
+	mux.HandleFunc("/hub/result", h.serveResult)
+	mux.HandleFunc("/hub/invite", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r) {
+			return
+		}
+		var req struct {
+			WorkerID string   `json:"workerId"`
+			Skills   []string `json:"skills"`
+			TTLH     int      `json:"ttlHours,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WorkerID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad invite request"})
+			return
+		}
+		inv, err := h.MintInvite(req.WorkerID, req.Skills, time.Duration(req.TTLH)*time.Hour)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"code": inv.Code, "workerId": inv.WorkerID, "skills": inv.Skills,
+			"expiresAt": inv.ExpiresAt,
+			"joinHint":  fmt.Sprintf("a2aworker join --hub <this-hub-url> --invite %s", inv.Code),
+		})
+	})
+	mux.HandleFunc("/hub/dispatch", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r) {
+			return
+		}
+		var req struct {
+			Tenant   string         `json:"tenant"`
+			Skill    string         `json:"skill"`
+			Prompt   string         `json:"prompt"`
+			Metadata map[string]any `json:"metadata,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Tenant == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad dispatch"})
+			return
+		}
+		id, err := h.Dispatch(req.Tenant, req.Skill, req.Prompt, req.Metadata)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"jobId": id})
+	})
+	mux.HandleFunc("/hub/result/", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r) {
+			return
+		}
+		jobID := strings.TrimPrefix(r.URL.Path, "/hub/result/")
+		res, ok := h.ResultOf(jobID)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "no result yet"})
+			return
+		}
+		parts := strings.SplitN(res, "|", 2)
+		writeJSON(w, http.StatusOK, map[string]any{"state": parts[0], "output": parts[1]})
+	})
+	mux.HandleFunc("/hub/workers", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r) {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"workers": h.WorkersSnapshot()})
+	})
+	return mux
 }
 
 // ---- HTTP 핸들러 ----
@@ -260,6 +357,12 @@ func (h *Hub) serveResult(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// verifyWorker가 돌려준 포인터는 락 밖에서 오래됐을 수 있다(re-join 교체).
+	// 락 안에서 현재 등록부를 다시 가져온다.
+	if wreg = h.workers[wreg.ID]; wreg == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "worker no longer registered"})
+		return
+	}
 	job, ok := h.jobs[req.JobID]
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown job"})

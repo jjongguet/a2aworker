@@ -76,73 +76,22 @@ func splitACP(s string) []string { return strings.Fields(s) }
 
 // runHub — 허브 모드: :9600에 hub HTTP 서버 + 초대코드 콘솔 명령 안내.
 func runHub() {
+	adminToken := os.Getenv("A2A_ADMIN_TOKEN")
+	if adminToken == "" {
+		fmt.Fprintln(os.Stderr, "warning: A2A_ADMIN_TOKEN not set — operator endpoints (/hub/invite, /hub/dispatch, /hub/result/<id>, /hub/workers) are DISABLED (403).")
+	}
 	hub := NewHub()
 	hub.StartGC(5 * time.Minute)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/hub/join", hub.serveJoin)
-	mux.HandleFunc("/hub/invite", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			WorkerID string   `json:"workerId"`
-			Skills   []string `json:"skills"`
-			TTLH     int      `json:"ttlHours,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WorkerID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad invite request"})
-			return
-		}
-		inv, err := hub.MintInvite(req.WorkerID, req.Skills, time.Duration(req.TTLH)*time.Hour)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"code": inv.Code, "workerId": inv.WorkerID, "skills": inv.Skills,
-			"expiresAt": inv.ExpiresAt,
-			"joinHint":  fmt.Sprintf("a2aworker join --hub <this-hub-url> --invite %s", inv.Code),
-		})
-	})
-	mux.HandleFunc("/hub/poll", func(w http.ResponseWriter, r *http.Request) { hub.servePoll(w, r) })
-	mux.HandleFunc("/hub/result", hub.serveResult)
-	mux.HandleFunc("/hub/dispatch", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Tenant   string         `json:"tenant"`
-			Skill    string         `json:"skill"`
-			Prompt   string         `json:"prompt"`
-			Metadata map[string]any `json:"metadata,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Tenant == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad dispatch"})
-			return
-		}
-		id, err := hub.Dispatch(req.Tenant, req.Skill, req.Prompt, req.Metadata)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"jobId": id})
-	})
-	mux.HandleFunc("/hub/result/", func(w http.ResponseWriter, r *http.Request) {
-		jobID := strings.TrimPrefix(r.URL.Path, "/hub/result/")
-		res, ok := hub.ResultOf(jobID)
-		if !ok {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "no result yet"})
-			return
-		}
-		parts := strings.SplitN(res, "|", 2)
-		writeJSON(w, http.StatusOK, map[string]any{"state": parts[0], "output": parts[1]})
-	})
-	mux.HandleFunc("/hub/workers", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"workers": hub.WorkersSnapshot()})
-	})
-
-	fmt.Println("hub mode: :9600 (endpoints /hub/join|poll|result|dispatch|result/<id>|workers)")
+	fmt.Println("hub mode: :9600 (endpoints /hub/join|poll|result|invite|dispatch|result/<id>|workers)")
 	fmt.Println("운영자 흐름:")
-	fmt.Println("  1. 초대코드 발급: curl -X POST localhost:9600/hub/invite -d '{\"workerId\":\"gjc\",\"skills\":[\"code.review\",\"code.implement\"]}'")
+	fmt.Println("  1. 초대코드 발급: curl -X POST localhost:9600/hub/invite -H 'Authorization: Bearer $A2A_ADMIN_TOKEN' -d '{\"workerId\":\"gjc\",\"skills\":[\"code.review\",\"code.implement\"]}'")
 	fmt.Println("  2. 남의 PC에서: a2aworker join --hub http://<허브>:9600 --invite <코드>")
 	fmt.Println("     (또는 A2A_MODE=join a2aworker --hub ... --invite ...)")
 	fmt.Println("  3. 워커 상주: A2A_MODE=work a2aworker")
-
-	http.ListenAndServe(":9600", mux)
+	if err := http.ListenAndServe(":9600", hub.Handler(adminToken)); err != nil {
+		fmt.Fprintln(os.Stderr, "hub server failed:", err)
+		os.Exit(1)
+	}
 }
 
 func runBridgeDemo() {

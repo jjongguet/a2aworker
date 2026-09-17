@@ -5,6 +5,9 @@
 package main
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,5 +79,61 @@ func TestRunACPAgentPromptDeadlineFires(t *testing.T) {
 	// 예전 구조는 ReadString 블로킹 때문에 이 데드라인이 절대 안 터졌다.
 	if elapsed > 10*time.Second {
 		t.Fatalf("deadline should fire promptly, took %v", elapsed)
+	}
+}
+
+// TestPollOnceAuthRejected — hub가 토큰을 401로 거절하면 일시 오류가 아니라
+// errAuthRejected로 전파된다(예전엔 그냥 "poll error"로 5초마다 영구 스픈).
+func TestPollOnceAuthRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "worker auth failed"})
+	}))
+	defer srv.Close()
+	_, err := pollOnce(http.DefaultClient, srv.URL, &WorkerConfig{WorkerID: "w1"})
+	if !errors.Is(err, errAuthRejected) {
+		t.Fatalf("401 poll should surface errAuthRejected, got %v", err)
+	}
+}
+
+// TestReportResultRetryRecovers — 일시 실패(500) 뒤 성공: 결과를 버리지 않고
+// 재시도로 보고한다(1회 실패로 버리면 hub가 재배일해 이중 실행된다).
+func TestReportResultRetryRecovers(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	orig := reportRetryBackoff
+	reportRetryBackoff = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { reportRetryBackoff = orig })
+
+	if err := reportResultRetry(http.DefaultClient, srv.URL, &WorkerConfig{WorkerID: "w1"}, "job-0001", StateCompleted, "done"); err != nil {
+		t.Fatalf("retry should recover after transient failures: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("want 3 attempts, got %d", attempts)
+	}
+}
+
+// TestReportResultRetryAuthFailsFast — 401은 재시도해도 회복되지 않으므로 1회에 그친다.
+func TestReportResultRetryAuthFailsFast(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "worker auth failed"})
+	}))
+	defer srv.Close()
+
+	if err := reportResultRetry(http.DefaultClient, srv.URL, &WorkerConfig{WorkerID: "w1"}, "job-0001", StateCompleted, "done"); !errors.Is(err, errAuthRejected) {
+		t.Fatalf("want errAuthRejected, got %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("auth rejection must not be retried, got %d attempts", attempts)
 	}
 }
